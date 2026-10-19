@@ -1,7 +1,9 @@
 import os
 import re
+import json
 import unicodedata
 from datetime import datetime, timezone
+from pathlib import Path
 from urllib.parse import urlparse
 
 import discord
@@ -284,6 +286,184 @@ class LeakDetailsModal(discord.ui.Modal, title="Personnaliser le leak"):
                 "❌ Je n'ai pas la permission d'envoyer des messages/embeds dans le salon choisi.",
                 ephemeral=True
             )
+
+# -------------------- SYSTÈME DE TICKETS CONFIGURABLE --------------------
+TICKET_CONFIG_FILE = Path("ticket_config.json")
+DEFAULT_TICKET_CONFIG = {
+    "title": "🎫 Support NSK Leaks",
+    "description": "Choisis le type de ticket dont tu as besoin dans le menu ci-dessous.",
+    "category_id": None,
+    "panel_channel_id": None,
+    "staff_role_id": None,
+    "types": ["Plainte", "Partenariat", "Création bot Discord", "Support"]
+}
+
+def load_ticket_configs():
+    try:
+        with TICKET_CONFIG_FILE.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+def save_ticket_configs(data):
+    try:
+        with TICKET_CONFIG_FILE.open("w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except OSError as exc:
+        print(f"Impossible de sauvegarder la configuration des tickets : {exc}")
+
+ticket_configs = load_ticket_configs()
+
+def get_ticket_config(guild_id: int):
+    key = str(guild_id)
+    if key not in ticket_configs:
+        ticket_configs[key] = dict(DEFAULT_TICKET_CONFIG)
+        ticket_configs[key]["types"] = list(DEFAULT_TICKET_CONFIG["types"])
+    else:
+        for k, v in DEFAULT_TICKET_CONFIG.items():
+            ticket_configs[key].setdefault(k, list(v) if isinstance(v, list) else v)
+    return ticket_configs[key]
+
+def ticket_slug(value: str) -> str:
+    value = unicodedata.normalize("NFKD", value.casefold())
+    value = "".join(c for c in value if not unicodedata.combining(c))
+    return re.sub(r"[^a-z0-9]+", "-", value).strip("-")[:70] or "ticket"
+
+class TicketTypeSelect(discord.ui.Select):
+    def __init__(self, guild: discord.Guild):
+        self.guild_id = guild.id
+        cfg = get_ticket_config(guild.id)
+        options = [discord.SelectOption(label=t[:100], value=t[:100], description=f"Ouvrir un ticket : {t}"[:100]) for t in cfg["types"][:25]]
+        if not options:
+            options = [discord.SelectOption(label="Support", value="Support")]
+        super().__init__(placeholder="Choisis le type de ticket…", min_values=1, max_values=1, options=options, custom_id="nsk_ticket:type_select")
+
+    async def callback(self, interaction: discord.Interaction):
+        guild = interaction.guild
+        if guild is None:
+            return await interaction.response.send_message("Cette action fonctionne uniquement dans un serveur.", ephemeral=True)
+        cfg = get_ticket_config(guild.id)
+        chosen = self.values[0]
+        category = guild.get_channel(cfg.get("category_id") or 0)
+        if not isinstance(category, discord.CategoryChannel):
+            category = None
+        base = f"{ticket_slug(chosen)}-{ticket_slug(interaction.user.name)}"
+        channel_name = base[:95]
+        existing = discord.utils.get(guild.text_channels, name=channel_name)
+        if existing:
+            return await interaction.response.send_message(f"Tu as déjà un ticket correspondant : {existing.mention}", ephemeral=True)
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, attach_files=True, embed_links=True),
+        }
+        bot_member = guild.me
+        if bot_member:
+            overwrites[bot_member] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_channels=True)
+        staff_role = guild.get_role(cfg.get("staff_role_id") or 0)
+        if staff_role:
+            overwrites[staff_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_messages=True)
+        try:
+            channel = await guild.create_text_channel(channel_name, category=category, overwrites=overwrites, topic=f"Ticket {chosen} ouvert par {interaction.user} ({interaction.user.id})")
+            await interaction.response.send_message(f"✅ Ton ticket a été créé : {channel.mention}", ephemeral=True)
+            await channel.send(f"Bonjour {interaction.user.mention} ! Ton ticket **{chosen}** est ouvert. Décris ta demande ci-dessous.")
+        except discord.Forbidden:
+            if not interaction.response.is_done():
+                await interaction.response.send_message("❌ Il me manque la permission Gérer les salons / Voir les salons.", ephemeral=True)
+        except discord.DiscordException as exc:
+            print(f"Erreur de création de ticket : {exc}")
+            if not interaction.response.is_done():
+                await interaction.response.send_message("❌ Impossible de créer le ticket. Vérifie mes permissions.", ephemeral=True)
+
+class TicketPanelView(discord.ui.View):
+    def __init__(self, guild: discord.Guild):
+        super().__init__(timeout=None)
+        self.add_item(TicketTypeSelect(guild))
+
+
+ticket_config_group = app_commands.Group(name="ticket_config", description="Configurer le système de tickets NSK Leaks")
+
+@ticket_config_group.command(name="apparence", description="Modifier le titre et la description du panneau")
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(titre="Titre du panneau", description="Description du panneau")
+async def ticket_config_apparence(interaction: discord.Interaction, titre: app_commands.Range[str, 1, 200], description: app_commands.Range[str, 1, 1000]):
+    if not interaction.guild:
+        return await interaction.response.send_message("Commande réservée à un serveur.", ephemeral=True)
+    cfg = get_ticket_config(interaction.guild.id)
+    cfg["title"], cfg["description"] = titre, description
+    save_ticket_configs(ticket_configs)
+    await interaction.response.send_message("✅ Apparence du panneau enregistrée. Utilise `/ticket_config envoyer` pour publier le panneau mis à jour.", ephemeral=True)
+
+@ticket_config_group.command(name="categorie", description="Choisir la catégorie où les tickets seront créés")
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(categorie="Catégorie Discord pour les nouveaux tickets")
+async def ticket_config_categorie(interaction: discord.Interaction, categorie: discord.CategoryChannel):
+    if not interaction.guild:
+        return await interaction.response.send_message("Commande réservée à un serveur.", ephemeral=True)
+    cfg = get_ticket_config(interaction.guild.id)
+    cfg["category_id"] = categorie.id
+    save_ticket_configs(ticket_configs)
+    await interaction.response.send_message(f"✅ Les tickets seront créés dans la catégorie **{categorie.name}**.", ephemeral=True)
+
+@ticket_config_group.command(name="envoyer", description="Envoyer le panneau de tickets dans un salon")
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(salon="Salon textuel où publier le panneau")
+async def ticket_config_envoyer(interaction: discord.Interaction, salon: discord.TextChannel):
+    if not interaction.guild:
+        return await interaction.response.send_message("Commande réservée à un serveur.", ephemeral=True)
+    cfg = get_ticket_config(interaction.guild.id)
+    embed = discord.Embed(title=cfg["title"][:256], description=cfg["description"][:4000], color=discord.Color.blurple())
+    embed.set_footer(text="NSK Leaks • Sélectionne un type de ticket dans le menu")
+    try:
+        await salon.send(embed=embed, view=TicketPanelView(interaction.guild))
+        cfg["panel_channel_id"] = salon.id
+        save_ticket_configs(ticket_configs)
+        await interaction.response.send_message(f"✅ Panneau de tickets envoyé dans {salon.mention}.", ephemeral=True)
+    except discord.Forbidden:
+        await interaction.response.send_message("❌ Je ne peux pas envoyer de messages dans ce salon.", ephemeral=True)
+
+@ticket_config_group.command(name="role_staff", description="Définir le rôle qui gère les tickets")
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(role="Rôle autorisé à voir et gérer les tickets")
+async def ticket_config_role_staff(interaction: discord.Interaction, role: discord.Role):
+    if not interaction.guild:
+        return await interaction.response.send_message("Commande réservée à un serveur.", ephemeral=True)
+    cfg = get_ticket_config(interaction.guild.id)
+    cfg["staff_role_id"] = role.id
+    save_ticket_configs(ticket_configs)
+    await interaction.response.send_message(f"✅ Le rôle staff des tickets est maintenant {role.mention}.", ephemeral=True)
+
+@ticket_config_group.command(name="type_ajouter", description="Ajouter un type de ticket au menu")
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(nom="Nom du type, par exemple Support ou Partenariat")
+async def ticket_config_type_ajouter(interaction: discord.Interaction, nom: app_commands.Range[str, 2, 100]):
+    if not interaction.guild:
+        return await interaction.response.send_message("Commande réservée à un serveur.", ephemeral=True)
+    cfg = get_ticket_config(interaction.guild.id)
+    existing = next((t for t in cfg["types"] if t.casefold() == nom.strip().casefold()), None)
+    if existing:
+        return await interaction.response.send_message(f"Le type **{existing}** existe déjà.", ephemeral=True)
+    if len(cfg["types"]) >= 25:
+        return await interaction.response.send_message("❌ Discord autorise au maximum 25 types dans ce menu. Retire d'abord un type.", ephemeral=True)
+    cfg["types"].append(nom.strip())
+    save_ticket_configs(ticket_configs)
+    await interaction.response.send_message(f"✅ Type **{nom.strip()}** ajouté. Republie le panneau avec `/ticket_config envoyer` pour mettre le menu à jour.", ephemeral=True)
+
+@ticket_config_group.command(name="type_retirer", description="Retirer un type de ticket du menu")
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(nom="Nom exact du type à retirer")
+async def ticket_config_type_retirer(interaction: discord.Interaction, nom: str):
+    if not interaction.guild:
+        return await interaction.response.send_message("Commande réservée à un serveur.", ephemeral=True)
+    cfg = get_ticket_config(interaction.guild.id)
+    match = next((t for t in cfg["types"] if t.casefold() == nom.strip().casefold()), None)
+    if not match:
+        return await interaction.response.send_message("❌ Ce type n'existe pas dans le menu.", ephemeral=True)
+    cfg["types"].remove(match)
+    save_ticket_configs(ticket_configs)
+    await interaction.response.send_message(f"✅ Type **{match}** retiré. Republie le panneau avec `/ticket_config envoyer` pour mettre le menu à jour.", ephemeral=True)
+
+bot.tree.add_command(ticket_config_group)
 
 @bot.event
 async def on_ready():
